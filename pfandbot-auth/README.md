@@ -2,6 +2,7 @@
 
 A Rust-based authentication proxy that allows managing multiple Microsoft accounts for Minecraft, with built-in support for Meteor Client and other Minecraft clients.
 
+Readme made by Claude im to lazy
 ## Features
 
 - **Multiple Account Support**: Store and manage multiple Microsoft accounts
