@@ -25,19 +25,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the authentication server
     Start {
-        // Port to bind to
         #[arg(short, long)]
         port: Option<u16>,
     },
-    /// Setup initial configuration
     Setup,
-    /// Add a new account
     AddAccount,
-    // List all accounts
     ListAccounts,
-    /// Generate a new API key
     GenerateKey,
 }
 
@@ -113,7 +107,6 @@ impl CacheEntry {
     }
 }
 
-// Serialization helper for SystemTime
 mod serde_system_time {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -391,18 +384,26 @@ async fn session_join(
     Json(payload): Json<SessionJoinRequest>,
     cache: Arc<RwLock<AuthCache>>,
 ) -> StatusCode {
-    log("SESSION", &format!("Join request for server ID: {}", payload.server_id));
+    log("SESSION", &format!("Join request received - Server ID: {}, Selected Profile: {}",
+        payload.server_id, payload.selected_profile));
+    log("SESSION", &format!("Access token (first 20 chars): {}",
+        &payload.access_token.chars().take(20).collect::<String>()));
 
     let cache_read = cache.read().await;
 
-    for (_account_id, entry) in cache_read.entries.iter() {
+    log("SESSION", &format!("Checking against {} cached entries", cache_read.entries.len()));
+
+    for (account_id, entry) in cache_read.entries.iter() {
+        log("SESSION", &format!("Checking account {}: UUID={}, Username={}",
+            account_id, entry.token.uuid, entry.token.username));
+
         if entry.is_valid() && entry.token.access_token == payload.access_token {
-            log("SESSION", &format!("Valid token found for UUID: {}", entry.token.uuid));
+            log("SESSION", &format!("✓ Valid token found for UUID: {}", entry.token.uuid));
             return StatusCode::NO_CONTENT;
         }
     }
 
-    log("SESSION", "Invalid or expired token");
+    log("SESSION", "✗ Invalid or expired token - no match found");
     StatusCode::FORBIDDEN
 }
 
@@ -424,6 +425,8 @@ async fn session_has_joined(
     Query(params): Query<HashMap<String, String>>,
     cache: Arc<RwLock<AuthCache>>,
 ) -> Result<Json<SessionProfile>, StatusCode> {
+    log("SESSION", &format!("Has joined check - Query params: {:?}", params));
+
     let username = params.get("username").ok_or(StatusCode::BAD_REQUEST)?;
     let server_id = params.get("serverId").ok_or(StatusCode::BAD_REQUEST)?;
 
@@ -431,10 +434,15 @@ async fn session_has_joined(
 
     let cache_read = cache.read().await;
 
+    log("SESSION", &format!("Checking against {} cached entries", cache_read.entries.len()));
+
     // find user by username
-    for (_account_id, entry) in cache_read.entries.iter() {
+    for (account_id, entry) in cache_read.entries.iter() {
+        log("SESSION", &format!("Checking account {}: UUID={}, Username={}",
+            account_id, entry.token.uuid, entry.token.username));
+
         if entry.is_valid() && entry.token.username == *username {
-            log("SESSION", &format!("Found valid session for {}", username));
+            log("SESSION", &format!("✓ Found valid session for {}", username));
             return Ok(Json(SessionProfile {
                 id: entry.token.uuid.clone(),
                 name: entry.token.username.clone(),
@@ -443,7 +451,7 @@ async fn session_has_joined(
         }
     }
 
-    log("SESSION", &format!("No valid session found for {}", username));
+    log("SESSION", &format!("✗ No valid session found for {}", username));
     Err(StatusCode::NO_CONTENT)
 }
 
