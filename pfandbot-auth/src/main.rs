@@ -488,7 +488,7 @@ struct ServerInfo {
 
 async fn get_server_info() -> Json<ServerInfo> {
     log("INFO", "Server info requested");
-    // dummy public key (fine in this case)
+    // dummy public key (fine in this case i think)
     Json(ServerInfo {
         signature_publickey: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n-----END PUBLIC KEY-----".to_string(),
         skin_domains: vec!["textures.minecraft.net".to_string()],
@@ -524,7 +524,7 @@ fn load_accounts() -> Vec<Account> {
             email: "account2@example.com".to_string(),
             display_name: "Account 2".to_string(),
         },
-    ]
+    ]//TODO: Find Better way to do ts
 }
 
 #[derive(Deserialize)]
@@ -644,7 +644,6 @@ async fn main() {
             return;
         }
         Some(Commands::Start { port: cmd_port }) => {
-            // Load config or create default
             let mut config = Config::load().unwrap_or_else(|_| {
                 println!("No config.json found. Run 'pfandbot-auth setup' to configure.");
                 println!("Using default configuration...\n");
@@ -653,7 +652,6 @@ async fn main() {
                 cfg
             });
 
-            // Override port if specified
             if let Some(p) = cmd_port {
                 config.server.port = p;
             }
@@ -671,7 +669,6 @@ async fn main() {
             start_server(config, cache, accounts).await;
         }
         None => {
-            // Same as Start without port override
             let config = Config::load().unwrap_or_else(|_| {
                 println!("No config.json found. Run 'pfandbot-auth setup' to configure.");
                 println!("Using default configuration...\n");
@@ -714,9 +711,7 @@ async fn start_server(
             let config = Arc::clone(&config);
             move |query| get_token(query, cache, accounts, config)
         }))
-        // Public keys endpoint
         .route("/publickeys", get(get_public_keys))
-        // For Meteor Rejects Auth
         .route("/authserver/authenticate", post({
             let cache = Arc::clone(&cache);
             let accounts = Arc::clone(&accounts);
@@ -731,7 +726,6 @@ async fn start_server(
             let cache = Arc::clone(&cache);
             move |payload| yggdrasil_validate(payload, cache.clone())
         }))
-        // Session endpoints for joining servers
         .route("/session/minecraft/join", post({
             let cache = Arc::clone(&cache);
             move |payload| session_join(payload, cache.clone())
@@ -740,7 +734,6 @@ async fn start_server(
             let cache = Arc::clone(&cache);
             move |query| session_has_joined(query, cache.clone())
         }))
-        // Also support full Yggdrasil paths
         .route("/api/yggdrasil/authserver/authenticate", post({
             let cache = Arc::clone(&cache);
             let accounts = Arc::clone(&accounts);
