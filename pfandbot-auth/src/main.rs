@@ -97,6 +97,7 @@ struct Account {
 #[derive(Clone, Serialize, Deserialize)]
 struct CacheEntry {
     token: TokenResponse,
+    ms_refresh_token: String,
     #[serde(with = "serde_system_time")]
     expires_at: std::time::SystemTime,
 }
@@ -168,30 +169,100 @@ impl AuthCache {
         self.entries.get(&account_id).filter(|e| e.is_valid())
     }
 
-    fn set(&mut self, account_id: usize, token: TokenResponse, duration: std::time::Duration) {
+    fn set(&mut self, account_id: usize, token: TokenResponse, ms_refresh_token: String, duration: std::time::Duration) {
         self.entries.insert(
             account_id,
             CacheEntry {
                 token,
+                ms_refresh_token,
                 expires_at: std::time::SystemTime::now() + duration,
             },
         );
         self.save_to_file();
     }
+
+    async fn refresh(&mut self, account_id: usize) -> Result<TokenResponse, String> {
+        let entry = self.entries.get(&account_id)
+            .ok_or("No cached entry found for account")?;
+
+        log("AUTH", &format!("Refreshing expired token for account {}", account_id));
+
+        let client = reqwest::Client::new();
+
+
+        let ms_token_result = azalea_auth::refresh_ms_auth_token(
+            &client,
+            &entry.ms_refresh_token,
+            None,
+            None,
+        )
+            .await
+            .map_err(|e| format!("Failed to refresh MS token: {:?}", e))?;
+
+        let mc_token = azalea_auth::get_minecraft_token(&client, &ms_token_result.data.access_token)
+            .await
+            .map_err(|e| format!("Failed to get MC token: {:?}", e))?;
+
+        let new_token = TokenResponse {
+            access_token: mc_token.minecraft_access_token.clone(),
+            uuid: entry.token.uuid.clone(),
+            username: entry.token.username.clone(),
+        };
+
+        self.set(
+            account_id,
+            new_token.clone(),
+            ms_token_result.data.refresh_token,
+            std::time::Duration::from_secs(23 * 3600),
+        );
+
+        log("AUTH", &format!("Token refreshed successfully for account {}", account_id));
+        Ok(new_token)
+    }
 }
 
-async fn authenticate_with_microsoft(account: &Account) -> Result<TokenResponse, String> {
+struct AuthResultWithRefresh {
+    token: TokenResponse,
+    ms_refresh_token: String,
+}
+
+async fn authenticate_with_microsoft(account: &Account) -> Result<AuthResultWithRefresh, String> {
+    // Use azalea's built-in auth - it handles MS auth, refresh tokens, and caching
     let auth_result = azalea_auth::auth(
         &account.email,
-        azalea_auth::AuthOpts::default(),
+        azalea_auth::AuthOpts {
+            cache_file: Some(std::path::PathBuf::from(format!("azalea_cache_{}.json", account.email))),
+            ..Default::default()
+        },
     )
         .await
         .map_err(|e| format!("Auth failed: {:?}", e))?;
 
-    Ok(TokenResponse {
-        access_token: auth_result.access_token,
-        uuid: auth_result.profile.id.to_string(),
-        username: auth_result.profile.name,
+    // Load azalea's cache to get the MS refresh token
+    let cache_path = format!("azalea_cache_{}.json", account.email);
+    let ms_refresh_token = if let Ok(content) = std::fs::read_to_string(&cache_path) {
+        // Parse the cache file to extract the refresh token
+        if let Ok(cache_data) = serde_json::from_str::<serde_json::Value>(&content) {
+            cache_data.get("msa")
+                .and_then(|msa| msa.get("data"))
+                .and_then(|data| data.get("refresh_token"))
+                .and_then(|rt| rt.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    Ok(AuthResultWithRefresh {
+        token: TokenResponse {
+            access_token: auth_result.access_token,
+            uuid: auth_result.profile.id.to_string(),
+            username: auth_result.profile.name,
+        },
+        ms_refresh_token,
     })
 }
 
@@ -209,6 +280,7 @@ async fn get_token(
 
     let account = accounts.get(account_id).ok_or(StatusCode::BAD_REQUEST)?;
 
+    // Check cache first
     {
         let cache_read = cache.read().await;
         if let Some(entry) = cache_read.get(account_id) {
@@ -216,17 +288,33 @@ async fn get_token(
         }
     }
 
-    // reauth
-    let token = authenticate_with_microsoft(account)
+    // Try to refresh if we have a cached entry (even if expired)
+    {
+        let mut cache_write = cache.write().await;
+        if cache_write.entries.contains_key(&account_id) {
+            if let Ok(token) = cache_write.refresh(account_id).await {
+                return Ok(Json(token));
+            }
+            log("AUTH", "Token refresh failed, falling back to full auth");
+        }
+    }
+
+    // Full Microsoft authentication
+    let auth_result = authenticate_with_microsoft(account)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     {
         let mut cache_write = cache.write().await;
-        cache_write.set(account_id, token.clone(), std::time::Duration::from_secs(23 * 3600));
+        cache_write.set(
+            account_id,
+            auth_result.token.clone(),
+            auth_result.ms_refresh_token,
+            std::time::Duration::from_secs(23 * 3600),
+        );
     }
 
-    Ok(Json(token))
+    Ok(Json(auth_result.token))
 }
 
 // Yggdrasil-style authentication
@@ -293,28 +381,52 @@ async fn yggdrasil_authenticate(
         }
     }
 
-    log("AUTH", "No cached token found, authenticating with Microsoft...");
+    log("AUTH", "No cached token found, checking if we can refresh...");
 
-    // reauth
-    let token = authenticate_with_microsoft(account)
+    {
+        let mut cache_write = cache.write().await;
+        if cache_write.entries.contains_key(&account_id) {
+            if let Ok(token) = cache_write.refresh(account_id).await {
+                let response = YggdrasilAuthResponse {
+                    access_token: token.access_token,
+                    selected_profile: YggdrasilProfile {
+                        id: token.uuid,
+                        name: token.username,
+                    },
+                };
+                log("AUTH", "Token refreshed successfully, returning response");
+                return Ok(Json(response));
+            }
+            log("AUTH", "Token refresh failed, falling back to full auth");
+        }
+    }
+
+    log("AUTH", "Authenticating with Microsoft...");
+
+    let auth_result = authenticate_with_microsoft(account)
         .await
         .map_err(|e| {
             log("AUTH", &format!("Microsoft authentication failed: {}", e));
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    log("AUTH", &format!("Microsoft authentication successful - UUID: {}, Username: {}", token.uuid, token.username));
+    log("AUTH", &format!("Microsoft authentication successful - UUID: {}, Username: {}", auth_result.token.uuid, auth_result.token.username));
 
     {
         let mut cache_write = cache.write().await;
-        cache_write.set(account_id, token.clone(), std::time::Duration::from_secs(23 * 3600));
+        cache_write.set(
+            account_id,
+            auth_result.token.clone(),
+            auth_result.ms_refresh_token,
+            std::time::Duration::from_secs(23 * 3600),
+        );
     }
 
     let response = YggdrasilAuthResponse {
-        access_token: token.access_token,
+        access_token: auth_result.token.access_token,
         selected_profile: YggdrasilProfile {
-            id: token.uuid,
-            name: token.username,
+            id: auth_result.token.uuid,
+            name: auth_result.token.username,
         },
     };
 
