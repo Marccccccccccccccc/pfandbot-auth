@@ -95,10 +95,10 @@ Loaded 3 account(s):
   [2] Bot Account (your_email3@example.com)
 ```
 
-### In Meteor Client:
+### In Paid Metero Client:
 
 1. Go to the account settings/add account section
-2. Select "Custom Server" or "Auth Server" option
+2. Select "PfandBotAuth" option
 3. Fill in the fields:
    - **Username/Email**: Enter the account number (e.g., `0` for first account, `1` for second, etc.)
    - **Password**: Enter your API key (e.g., `your-secret-key-1`)
