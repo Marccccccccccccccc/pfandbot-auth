@@ -33,6 +33,8 @@ enum Commands {
     AddAccount,
     ListAccounts,
     GenerateKey,
+    RefreshAll,
+    RepairCache,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -219,6 +221,78 @@ impl AuthCache {
         log("AUTH", &format!("Token refreshed successfully for account {}", account_id));
         Ok(new_token)
     }
+
+    async fn refresh_all(&mut self, accounts: &[Account]) -> (usize, usize) {
+        let account_ids: Vec<usize> = self.entries.keys().copied().collect();
+        let mut success_count = 0;
+        let mut fail_count = 0;
+
+        for account_id in account_ids {
+            if account_id >= accounts.len() {
+                log("REFRESH", &format!("Skipping account {} (out of range)", account_id));
+                continue;
+            }
+
+            let account = &accounts[account_id];
+            log("REFRESH", &format!("Refreshing token for account {} ({})...", account_id, account.display_name));
+
+            match self.refresh(account_id).await {
+                Ok(_) => {
+                    success_count += 1;
+                    log("REFRESH", &format!("✓ Successfully refreshed account {}", account_id));
+                }
+                Err(e) => {
+                    fail_count += 1;
+                    log("REFRESH", &format!("✗ Failed to refresh account {}: {}", account_id, e));
+                }
+            }
+        }
+
+        (success_count, fail_count)
+    }
+
+    fn repair_from_azalea_cache(&mut self, accounts: &[Account]) -> (usize, usize) {
+        let mut repaired = 0;
+        let mut failed = 0;
+
+        for (account_id, entry) in self.entries.iter_mut() {
+            if !entry.ms_refresh_token.is_empty() {
+                continue; // Already has refresh token
+            }
+
+            if *account_id >= accounts.len() {
+                continue;
+            }
+
+            let account = &accounts[*account_id];
+            let cache_path = format!("azalea_cache_{}.json", account.email);
+
+            if let Ok(content) = std::fs::read_to_string(&cache_path) {
+                if let Ok(cache_data) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
+                    if let Some(refresh_token) = cache_data.first()
+                        .and_then(|e| e.get("msa"))
+                        .and_then(|msa| msa.get("data"))
+                        .and_then(|data| data.get("refresh_token"))
+                        .and_then(|rt| rt.as_str())
+                    {
+                        entry.ms_refresh_token = refresh_token.to_string();
+                        repaired += 1;
+                        log("REPAIR", &format!("✓ Repaired MS refresh token for account {} ({})", account_id, account.display_name));
+                        continue;
+                    }
+                }
+            }
+
+            failed += 1;
+            log("REPAIR", &format!("✗ Could not repair account {} ({})", account_id, account.display_name));
+        }
+
+        if repaired > 0 {
+            self.save_to_file();
+        }
+
+        (repaired, failed)
+    }
 }
 
 struct AuthResultWithRefresh {
@@ -242,17 +316,21 @@ async fn authenticate_with_microsoft(account: &Account) -> Result<AuthResultWith
     let cache_path = format!("azalea_cache_{}.json", account.email);
     let ms_refresh_token = if let Ok(content) = std::fs::read_to_string(&cache_path) {
         // Parse the cache file to extract the refresh token
-        if let Ok(cache_data) = serde_json::from_str::<serde_json::Value>(&content) {
-            cache_data.get("msa")
+        // Note: azalea cache is an array, not an object
+        if let Ok(cache_data) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
+            cache_data.first()
+                .and_then(|entry| entry.get("msa"))
                 .and_then(|msa| msa.get("data"))
                 .and_then(|data| data.get("refresh_token"))
                 .and_then(|rt| rt.as_str())
                 .unwrap_or("")
                 .to_string()
         } else {
+            log("AUTH", "Failed to parse azalea cache - MS refresh token will not be available");
             String::new()
         }
     } else {
+        log("AUTH", "Azalea cache file not found - MS refresh token will not be available");
         String::new()
     };
 
@@ -753,6 +831,59 @@ async fn main() {
         }
         Some(Commands::GenerateKey) => {
             generate_api_key();
+            return;
+        }
+        Some(Commands::RefreshAll) => {
+            println!("=== Refreshing All Tokens ===\n");
+
+            let accounts = load_accounts();
+            println!("Loaded {} account(s)\n", accounts.len());
+
+            let mut cache = AuthCache::new();
+
+            if cache.entries.is_empty() {
+                println!("No cached tokens found. Nothing to refresh.");
+                return;
+            }
+
+            println!("Found {} cached token(s) to refresh\n", cache.entries.len());
+
+            let (success, failed) = cache.refresh_all(&accounts).await;
+
+            println!("\n=== Refresh Summary ===");
+            println!("✓ Successfully refreshed: {}", success);
+            println!("✗ Failed to refresh: {}", failed);
+            println!("Total: {}", success + failed);
+
+            return;
+        }
+        Some(Commands::RepairCache) => {
+            println!("=== Repairing Token Cache ===\n");
+            println!("This will attempt to extract MS refresh tokens from azalea cache files.\n");
+
+            let accounts = load_accounts();
+            println!("Loaded {} account(s)\n", accounts.len());
+
+            let mut cache = AuthCache::new();
+
+            if cache.entries.is_empty() {
+                println!("No cached tokens found. Nothing to repair.");
+                return;
+            }
+
+            println!("Found {} cached token(s)\n", cache.entries.len());
+
+            let (repaired, failed) = cache.repair_from_azalea_cache(&accounts);
+
+            println!("\n=== Repair Summary ===");
+            println!("✓ Repaired: {}", repaired);
+            println!("✗ Failed: {}", failed);
+            println!("Total: {}", repaired + failed);
+
+            if repaired > 0 {
+                println!("\nCache has been updated. You can now use 'refresh-all' to refresh tokens.");
+            }
+
             return;
         }
         Some(Commands::Start { port: cmd_port }) => {
