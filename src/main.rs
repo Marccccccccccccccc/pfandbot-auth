@@ -94,6 +94,10 @@ struct TokenRequest {
 struct Account {
     email: String,
     display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ms_refresh_token: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -301,6 +305,68 @@ struct AuthResultWithRefresh {
 }
 
 async fn authenticate_with_microsoft(account: &Account) -> Result<AuthResultWithRefresh, String> {
+    // If we have a PrismLauncher refresh token, try using it first
+    if let Some(ref refresh_token) = account.ms_refresh_token {
+        log("AUTH", "Using PrismLauncher refresh token");
+        let client = reqwest::Client::new();
+
+        match azalea_auth::refresh_ms_auth_token(&client, refresh_token, None, None).await {
+            Ok(ms_token_result) => {
+                match azalea_auth::get_minecraft_token(&client, &ms_token_result.data.access_token).await {
+                    Ok(mc_token) => {
+                        let uuid = account.uuid.clone().unwrap_or_else(|| {
+                            log("AUTH", "No UUID in account, will need to fetch profile");
+                            String::new()
+                        });
+
+                        let username = if uuid.is_empty() {
+                            log("AUTH", "Fetching Minecraft profile");
+                            match azalea_auth::get_profile(&client, &mc_token.minecraft_access_token).await {
+                                Ok(profile) => {
+                                    let username = profile.name.clone();
+                                    let uuid = profile.id.to_string();
+                                    return Ok(AuthResultWithRefresh {
+                                        token: TokenResponse {
+                                            access_token: mc_token.minecraft_access_token,
+                                            uuid,
+                                            username,
+                                        },
+                                        ms_refresh_token: ms_token_result.data.refresh_token,
+                                    });
+                                },
+                                Err(e) => {
+                                    log("AUTH", &format!("Failed to get profile: {:?}, falling back to full auth", e));
+                                    // todo
+                                }
+                            }
+                            String::new()
+                        } else {
+                            account.display_name.clone()
+                        };
+
+                        if !uuid.is_empty() {
+                            return Ok(AuthResultWithRefresh {
+                                token: TokenResponse {
+                                    access_token: mc_token.minecraft_access_token,
+                                    uuid,
+                                    username,
+                                },
+                                ms_refresh_token: ms_token_result.data.refresh_token,
+                            });
+                        }
+                    },
+                    Err(e) => {
+                        log("AUTH", &format!("Failed to get MC token with PrismLauncher token: {:?}", e));
+                    }
+                }
+            },
+            Err(e) => {
+                log("AUTH", &format!("Failed to refresh PrismLauncher token: {:?}", e));
+            }
+        }
+        log("AUTH", "PrismLauncher token failed, falling back to full auth");
+    }
+
     // Use azalea's built-in auth - it handles MS auth, refresh tokens, and caching
     let auth_result = azalea_auth::auth(
         &account.email,
@@ -678,7 +744,7 @@ struct ServerInfo {
 
 async fn get_server_info() -> Json<ServerInfo> {
     log("INFO", "Server info requested");
-    // dummy public key (fine in this case i think)
+    // dummy public key (fine in this case I think)
     Json(ServerInfo {
         signature_publickey: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n-----END PUBLIC KEY-----".to_string(),
         skin_domains: vec!["textures.minecraft.net".to_string()],
@@ -693,12 +759,37 @@ async fn log_request(req: Request<Body>) -> StatusCode {
 
 fn load_accounts() -> Vec<Account> {
     if let Ok(content) = std::fs::read_to_string("accounts.json") {
+        // Try PrismLauncher format first
+        if let Ok(prism_accounts) = serde_json::from_str::<PrismLauncherAccounts>(&content) {
+            log("CONFIG", &format!("Loaded {} PrismLauncher account(s)", prism_accounts.accounts.len()));
+            return prism_accounts
+                .accounts
+                .into_iter()
+                .filter(|acc| acc.account_type == "MSA")
+                .map(|acc| {
+                    // Try to extract email from profile or use UUID as fallback
+                    let email = format!("{}@prism.local", acc.profile.id);
+
+                    Account {
+                        email,
+                        display_name: acc.profile.name.clone(),
+                        uuid: Some(acc.profile.id),
+                        ms_refresh_token: acc.msa.as_ref().map(|m| m.refresh_token.clone()),
+                    }
+                })
+                .collect();
+        }
+
+        // Fall back to simple format
         if let Ok(accounts) = serde_json::from_str::<Vec<AccountConfig>>(&content) {
+            log("CONFIG", &format!("Loaded {} simple account(s)", accounts.len()));
             return accounts
                 .into_iter()
                 .map(|cfg| Account {
                     email: cfg.email,
                     display_name: cfg.display_name,
+                    uuid: None,
+                    ms_refresh_token: None,
                 })
                 .collect();
         }
@@ -709,18 +800,48 @@ fn load_accounts() -> Vec<Account> {
         Account {
             email: "account1@qq.com".to_string(),
             display_name: "Account 1".to_string(),
+            uuid: None,
+            ms_refresh_token: None,
         },
         Account {
             email: "account2@example.com".to_string(),
             display_name: "Account 2".to_string(),
+            uuid: None,
+            ms_refresh_token: None,
         },
-    ]//TODO: Find Better way to do ts
+    ]
 }
 
 #[derive(Deserialize)]
 struct AccountConfig {
     email: String,
     display_name: String,
+}
+
+
+#[derive(Deserialize)]
+struct PrismLauncherAccounts {
+    accounts: Vec<PrismLauncherAccount>,
+}
+
+#[derive(Deserialize)]
+struct PrismLauncherAccount {
+    #[serde(default)]
+    msa: Option<PrismMsaData>,
+    profile: PrismProfile,
+    #[serde(rename = "type")]
+    account_type: String,
+}
+
+#[derive(Deserialize)]
+struct PrismMsaData {
+    refresh_token: String,
+}
+
+#[derive(Deserialize)]
+struct PrismProfile {
+    id: String,
+    name: String,
 }
 
 async fn run_setup() {
@@ -787,6 +908,8 @@ async fn add_account_interactive() {
     accounts.push(Account {
         email,
         display_name,
+        uuid: None,
+        ms_refresh_token: None,
     });
 
     let content = serde_json::to_string_pretty(&accounts).unwrap();
