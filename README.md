@@ -1,4 +1,4 @@
-# PfandBot Auth - Multi-Account Microsoft Authentication Proxy
+# PfandBot Auth - Multi-Account Microsoft Authentication Server
 
 A Rust-based authentication proxy that allows managing multiple Microsoft accounts for Minecraft, with built-in support for Meteor Client and other Minecraft clients.
 
