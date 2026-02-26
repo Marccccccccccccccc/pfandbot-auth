@@ -4,15 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = "0.7"
+axum = "0.8.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.13", features = ["json"] }
-tower-http = { version = "0.5", features = ["cors"] }
-azalea = { git = "https://github.com/azalea-rs/azalea" }
+tower-http = { version = "0.6.8", features = ["cors"] }
 azalea-auth = { git = "https://github.com/azalea-rs/azalea" }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
-dialoguer = "0.11"
+dialoguer = "0.12.0"
 rand = "0.9.2"
